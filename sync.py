@@ -181,18 +181,29 @@ def gcal_event_to_notion_date(gcal_event):
     return None, None
 
 
+def extract_title_from_notion(notion_item):
+    """Extract title from Notion page by finding the title property"""
+    properties = notion_item.get('properties', {})
+    
+    # Look for ANY property with type 'title'
+    for prop_name, prop_data in properties.items():
+        if prop_data.get('type') == 'title' and prop_data.get('title'):
+            if len(prop_data['title']) > 0:
+                title = prop_data['title'][0].get('plain_text', '')
+                if title:
+                    print(f"✅ Found title in '{prop_name}': {title}")
+                    return title
+    
+    return "Untitled Event"
+
 def notion_to_calendar_event(notion_item):
     """Convert a Notion item to a Google Calendar event"""
     properties = notion_item.get('properties', {})
 
-    # Extract title
-    title = "Untitled Event"
-    if 'Name' in properties:
-        title_prop = properties['Name']
-        if title_prop['type'] == 'title' and title_prop['title']:
-            title = title_prop['title'][0]['plain_text']
-
-    # Extract date(s)
+    # Use the flexible title extraction
+    title = extract_title_from_notion(notion_item)
+    
+    # Rest of the function stays the same...
     start_time = None
     end_time = None
     is_all_day = False
@@ -203,18 +214,15 @@ def notion_to_calendar_event(notion_item):
             start_time = date_prop['date']['start']
             end_time = date_prop['date'].get('end')
 
-            # Case: all-day (format = YYYY-MM-DD)
             if len(start_time) == 10:
                 is_all_day = True
                 if not end_time:
-                    # if no end date → set end = start + 1 day
                     end_date = datetime.strptime(start_time, "%Y-%m-%d") + timedelta(days=1)
                     end_time = end_date.strftime("%Y-%m-%d")
 
     if not start_time:
         return None
 
-    # Build calendar event
     event = {
         'summary': title,
         'description': f"Synced from Notion: {notion_item['url']}",
@@ -224,9 +232,7 @@ def notion_to_calendar_event(notion_item):
         event['start'] = {'date': start_time}
         event['end'] = {'date': end_time}
     else:
-        # Case: has time
         if not end_time:
-            # If only a start time exists, set end = start + 1 hour
             try:
                 dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                 dt_end = dt_start + timedelta(hours=1)

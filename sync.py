@@ -179,31 +179,31 @@ def gcal_event_to_notion_date(gcal_event):
         return start_datetime, end_datetime
 
     return None, None
-
-
-def extract_title_from_notion(notion_item):
-    """Extract title from Notion page by finding the title property"""
-    properties = notion_item.get('properties', {})
     
-    # Look for ANY property with type 'title'
-    for prop_name, prop_data in properties.items():
-        if prop_data.get('type') == 'title' and prop_data.get('title'):
-            if len(prop_data['title']) > 0:
-                title = prop_data['title'][0].get('plain_text', '')
-                if title:
-                    print(f"✅ Found title in '{prop_name}': {title}")
-                    return title
-    
-    return "Untitled Event"
-
 def notion_to_calendar_event(notion_item):
     """Convert a Notion item to a Google Calendar event"""
     properties = notion_item.get('properties', {})
 
-    # Use the flexible title extraction
-    title = extract_title_from_notion(notion_item)
-    
-    # Rest of the function stays the same...
+    # Extract title from "Project name" property (not "Name")
+    title = "Untitled Event"
+    if 'Project name' in properties:
+        title_prop = properties['Project name']
+        print(f"🔍 Debug - Project name property: {title_prop}")
+        
+        if title_prop.get('type') == 'title' and title_prop.get('title'):
+            if len(title_prop['title']) > 0:
+                title = title_prop['title'][0].get('plain_text', 'Untitled Event')
+                print(f"✅ Extracted title: '{title}'")
+            else:
+                print("❌ Project name title array is empty")
+        else:
+            print(f"❌ Invalid project name property structure")
+    else:
+        print("❌ No 'Project name' property found")
+        # Debug: show available properties
+        print(f"Available properties: {list(properties.keys())}")
+
+    # Extract date(s) - this part stays the same
     start_time = None
     end_time = None
     is_all_day = False
@@ -214,15 +214,18 @@ def notion_to_calendar_event(notion_item):
             start_time = date_prop['date']['start']
             end_time = date_prop['date'].get('end')
 
+            # Case: all-day (format = YYYY-MM-DD)
             if len(start_time) == 10:
                 is_all_day = True
                 if not end_time:
+                    # if no end date → set end = start + 1 day
                     end_date = datetime.strptime(start_time, "%Y-%m-%d") + timedelta(days=1)
                     end_time = end_date.strftime("%Y-%m-%d")
 
     if not start_time:
         return None
 
+    # Build calendar event
     event = {
         'summary': title,
         'description': f"Synced from Notion: {notion_item['url']}",
@@ -232,7 +235,9 @@ def notion_to_calendar_event(notion_item):
         event['start'] = {'date': start_time}
         event['end'] = {'date': end_time}
     else:
+        # Case: has time
         if not end_time:
+            # If only a start time exists, set end = start + 1 hour
             try:
                 dt_start = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
                 dt_end = dt_start + timedelta(hours=1)
@@ -244,7 +249,6 @@ def notion_to_calendar_event(notion_item):
         event['end'] = {'dateTime': end_time}
 
     return event
-
 
 def sync_notion_to_calendar(service, notion_items, notion_ids):
     """Sync Notion → Google Calendar"""

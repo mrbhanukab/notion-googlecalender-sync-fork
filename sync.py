@@ -414,7 +414,7 @@ def sync_calendar_to_notion(service, notion_items):
     return created_count, updated_count, deleted_count
 
 
-def main():
+def main(context):
     """Main sync function - handles both directions"""
     print("🔄 Starting 2-Way Notion ↔ Google Calendar sync...")
 
@@ -431,7 +431,7 @@ def main():
         print("🔗 Connected to Google Calendar")
     except Exception as e:
         print(f"❌ Failed to connect to Google Calendar: {e}")
-        return
+        return context.res.json({"error": f"Failed to connect to Google Calendar: {e}"})
 
     # Sync Notion → Google Calendar
     n2c_created, n2c_updated, n2c_skipped, n2c_deleted = sync_notion_to_calendar(
@@ -442,6 +442,22 @@ def main():
     c2n_created, c2n_updated, c2n_deleted = sync_calendar_to_notion(
         service, notion_items
     )
+
+    result = {
+        "success": True,
+        "message": "2-Way Sync Complete!",
+        "notion_to_calendar": {
+            "created": n2c_created,
+            "updated": n2c_updated,
+            "skipped": n2c_skipped,
+            "deleted": n2c_deleted
+        },
+        "calendar_to_notion": {
+            "created": c2n_created,
+            "updated": c2n_updated,
+            "deleted": c2n_deleted
+        }
+    }
 
     print(f"""
 🎉 2-Way Sync Complete!
@@ -458,6 +474,4 @@ Calendar → Notion:
   Deleted: {c2n_deleted}
 """)
 
-
-if __name__ == "__main__":
-    main()
+    return context.res.json(result)

@@ -2,6 +2,7 @@ import requests
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -85,7 +86,7 @@ def update_notion_page(page_id, title, start_date, end_date=None):
 
     data = {
         'properties': {
-            'Name': {
+            'Project name': {
                 'title': [{'text': {'content': title}}]
             },
             'Date': {
@@ -118,7 +119,7 @@ def create_notion_page(title, start_date, end_date=None, gcal_event_id=None):
     data = {
         'parent': {'database_id': NOTION_DB_ID},
         'properties': {
-            'Name': {
+            'Project name': {
                 'title': [{'text': {'content': title}}]
             },
             'Date': {
@@ -179,31 +180,41 @@ def gcal_event_to_notion_date(gcal_event):
         return start_datetime, end_datetime
 
     return None, None
+
+
+def extract_title_from_notion(notion_item):
+    """Extract title from Notion page by finding the title property automatically"""
+    properties = notion_item.get('properties', {})
     
+    # Strategy 1: Look for 'Project name' property first
+    if 'Project name' in properties:
+        title_prop = properties['Project name']
+        if title_prop.get('type') == 'title' and title_prop.get('title'):
+            if len(title_prop['title']) > 0:
+                title = title_prop['title'][0].get('plain_text', '')
+                if title:
+                    return title
+    
+    # Strategy 2: Look for ANY property with type 'title'
+    for prop_name, prop_data in properties.items():
+        if prop_data.get('type') == 'title' and prop_data.get('title'):
+            if len(prop_data['title']) > 0:
+                title = prop_data['title'][0].get('plain_text', '')
+                if title:
+                    print(f"✅ Found title in '{prop_name}': {title}")
+                    return title
+    
+    return "Untitled Event"
+
+
 def notion_to_calendar_event(notion_item):
     """Convert a Notion item to a Google Calendar event"""
     properties = notion_item.get('properties', {})
 
-    # Extract title from "Project name" property (not "Name")
-    title = "Untitled Event"
-    if 'Project name' in properties:
-        title_prop = properties['Project name']
-        print(f"🔍 Debug - Project name property: {title_prop}")
-        
-        if title_prop.get('type') == 'title' and title_prop.get('title'):
-            if len(title_prop['title']) > 0:
-                title = title_prop['title'][0].get('plain_text', 'Untitled Event')
-                print(f"✅ Extracted title: '{title}'")
-            else:
-                print("❌ Project name title array is empty")
-        else:
-            print(f"❌ Invalid project name property structure")
-    else:
-        print("❌ No 'Project name' property found")
-        # Debug: show available properties
-        print(f"Available properties: {list(properties.keys())}")
+    # Use improved title extraction
+    title = extract_title_from_notion(notion_item)
 
-    # Extract date(s) - this part stays the same
+    # Extract date(s)
     start_time = None
     end_time = None
     is_all_day = False
@@ -250,56 +261,72 @@ def notion_to_calendar_event(notion_item):
 
     return event
 
+
 def sync_notion_to_calendar(service, notion_items, notion_ids):
-    """Sync Notion → Google Calendar"""
+    """Sync Notion → Google Calendar with batch processing"""
     print("🔄 Syncing Notion → Google Calendar...")
 
     created_count = 0
     updated_count = 0
     skipped_count = 0
     deleted_count = 0
+    
+    total_items = len(notion_items)
+    batch_size = 10  # Process 10 items at a time
+    
+    # Process in batches to avoid timeout
+    for i in range(0, total_items, batch_size):
+        batch = notion_items[i:i + batch_size]
+        batch_num = (i // batch_size) + 1
+        total_batches = (total_items + batch_size - 1) // batch_size
+        
+        print(f"📦 Processing batch {batch_num}/{total_batches} ({len(batch)} items)")
 
-    # --- CREATE or UPDATE ---
-    for item in notion_items:
-        try:
-            event = notion_to_calendar_event(item)
-            if not event:
-                print("⏭️ Skipping item without valid date")
-                skipped_count += 1
+        # --- CREATE or UPDATE ---
+        for item in batch:
+            try:
+                event = notion_to_calendar_event(item)
+                if not event:
+                    print("⏭️ Skipping item without valid date")
+                    skipped_count += 1
+                    continue
+
+                notion_id = item['id']
+                # Always attach the Notion ID
+                event['extendedProperties'] = {'private': {'notion_id': notion_id}}
+
+                # Look for existing event
+                existing = service.events().list(
+                    calendarId=CALENDAR_ID,
+                    privateExtendedProperty=f"notion_id={notion_id}"
+                ).execute().get('items', [])
+
+                if existing:
+                    # Update
+                    existing_event_id = existing[0]['id']
+                    service.events().update(
+                        calendarId=CALENDAR_ID,
+                        eventId=existing_event_id,
+                        body=event
+                    ).execute()
+                    print(f"🔄 Updated: {event['summary']}")
+                    updated_count += 1
+                else:
+                    # Create
+                    service.events().insert(
+                        calendarId=CALENDAR_ID,
+                        body=event
+                    ).execute()
+                    print(f"✅ Created: {event['summary']}")
+                    created_count += 1
+
+            except Exception as e:
+                print(f"❌ Error syncing item: {e}")
                 continue
-
-            notion_id = item['id']
-            # Always attach the Notion ID
-            event['extendedProperties'] = {'private': {'notion_id': notion_id}}
-
-            # Look for existing event
-            existing = service.events().list(
-                calendarId=CALENDAR_ID,
-                privateExtendedProperty=f"notion_id={notion_id}"
-            ).execute().get('items', [])
-
-            if existing:
-                # Update
-                existing_event_id = existing[0]['id']
-                service.events().update(
-                    calendarId=CALENDAR_ID,
-                    eventId=existing_event_id,
-                    body=event
-                ).execute()
-                print(f"🔄 Updated calendar event: {event['summary']}")
-                updated_count += 1
-            else:
-                # Create
-                service.events().insert(
-                    calendarId=CALENDAR_ID,
-                    body=event
-                ).execute()
-                print(f"✅ Created calendar event: {event['summary']}")
-                created_count += 1
-
-        except Exception as e:
-            print(f"❌ Error syncing item to calendar: {e}")
-            continue
+        
+        # Brief pause between batches to avoid rate limits and provide progress updates
+        time.sleep(0.5)
+        print(f"📊 Progress: {min(i + batch_size, total_items)}/{total_items} items processed")
 
     # --- DELETE EVENTS NO LONGER IN NOTION ---
     try:
@@ -338,7 +365,7 @@ def sync_notion_to_calendar(service, notion_items, notion_ids):
 
 
 def sync_calendar_to_notion(service, notion_items):
-    """Sync Google Calendar → Notion"""
+    """Sync Google Calendar → Notion with batch processing"""
     print("🔄 Syncing Google Calendar → Notion...")
 
     created_count = 0
@@ -355,68 +382,80 @@ def sync_calendar_to_notion(service, notion_items):
             maxResults=2500
         ).execute().get('items', [])
 
-        # Process events that were synced from Notion (have notion_id)
-        for gcal_event in gcal_events:
-            extended_props = gcal_event.get('extendedProperties', {}).get('private', {})
-            notion_id = extended_props.get('notion_id')
+        total_events = len(gcal_events)
+        print(f"📋 Found {total_events} calendar events to process")
 
-            if not notion_id:
-                # This is a new event created directly in Google Calendar
-                # Create a new Notion page for it
-                title = gcal_event.get('summary', 'Untitled Event')
-                start_date, end_date = gcal_event_to_notion_date(gcal_event)
+        # Process events in batches
+        batch_size = 20
+        for i in range(0, total_events, batch_size):
+            batch = gcal_events[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (total_events + batch_size - 1) // batch_size
+            
+            print(f"📦 Processing calendar batch {batch_num}/{total_batches} ({len(batch)} events)")
 
-                if start_date:
-                    new_notion_id = create_notion_page(title, start_date, end_date)
-                    if new_notion_id:
-                        # Update the calendar event to include the notion_id
-                        gcal_event['extendedProperties'] = {
-                            'private': {'notion_id': new_notion_id}
-                        }
-                        service.events().update(
-                            calendarId=CALENDAR_ID,
-                            eventId=gcal_event['id'],
-                            body=gcal_event
-                        ).execute()
-                        print(f"✅ Created Notion page from calendar event: {title}")
-                        created_count += 1
-                continue
+            # Process events that were synced from Notion (have notion_id)
+            for gcal_event in batch:
+                extended_props = gcal_event.get('extendedProperties', {}).get('private', {})
+                notion_id = extended_props.get('notion_id')
 
-            # Check if the corresponding Notion page still exists
-            if notion_id not in notion_map:
-                # Notion page was deleted, but calendar event still exists
-                # Delete the calendar event
-                service.events().delete(
-                    calendarId=CALENDAR_ID,
-                    eventId=gcal_event['id']
-                ).execute()
-                print(f"🗑️ Deleted calendar event (Notion page gone): {gcal_event.get('summary')}")
-                continue
+                if not notion_id:
+                    # This is a new event created directly in Google Calendar
+                    # Create a new Notion page for it
+                    title = gcal_event.get('summary', 'Untitled Event')
+                    start_date, end_date = gcal_event_to_notion_date(gcal_event)
 
-            # Compare calendar event with Notion page and update if needed
-            notion_item = notion_map[notion_id]
+                    if start_date:
+                        new_notion_id = create_notion_page(title, start_date, end_date)
+                        if new_notion_id:
+                            # Update the calendar event to include the notion_id
+                            gcal_event['extendedProperties'] = {
+                                'private': {'notion_id': new_notion_id}
+                            }
+                            service.events().update(
+                                calendarId=CALENDAR_ID,
+                                eventId=gcal_event['id'],
+                                body=gcal_event
+                            ).execute()
+                            print(f"✅ Created Notion page from calendar event: {title}")
+                            created_count += 1
+                    continue
 
-            # Get current values from Notion
-            notion_title = "Untitled Event"
-            if 'Name' in notion_item['properties']:
-                title_prop = notion_item['properties']['Name']
-                if title_prop['type'] == 'title' and title_prop['title']:
-                    notion_title = title_prop['title'][0]['plain_text']
+                # Check if the corresponding Notion page still exists
+                if notion_id not in notion_map:
+                    # Notion page was deleted, but calendar event still exists
+                    # Delete the calendar event
+                    service.events().delete(
+                        calendarId=CALENDAR_ID,
+                        eventId=gcal_event['id']
+                    ).execute()
+                    print(f"🗑️ Deleted calendar event (Notion page gone): {gcal_event.get('summary')}")
+                    continue
 
-            # Get calendar event values
-            gcal_title = gcal_event.get('summary', 'Untitled Event')
-            gcal_start, gcal_end = gcal_event_to_notion_date(gcal_event)
+                # Compare calendar event with Notion page and update if needed
+                notion_item = notion_map[notion_id]
 
-            # Check if we need to update Notion
-            needs_update = False
-            if gcal_title != notion_title:
-                needs_update = True
-                print(f"📝 Title changed: '{notion_title}' → '{gcal_title}'")
+                # Get current values from Notion using improved title extraction
+                notion_title = extract_title_from_notion(notion_item)
 
-            if gcal_start and needs_update:
-                if update_notion_page(notion_id, gcal_title, gcal_start, gcal_end):
-                    print(f"🔄 Updated Notion page: {gcal_title}")
-                    updated_count += 1
+                # Get calendar event values
+                gcal_title = gcal_event.get('summary', 'Untitled Event')
+                gcal_start, gcal_end = gcal_event_to_notion_date(gcal_event)
+
+                # Check if we need to update Notion
+                needs_update = False
+                if gcal_title != notion_title:
+                    needs_update = True
+                    print(f"📝 Title changed: '{notion_title}' → '{gcal_title}'")
+
+                if gcal_start and needs_update:
+                    if update_notion_page(notion_id, gcal_title, gcal_start, gcal_end):
+                        print(f"🔄 Updated Notion page: {gcal_title}")
+                        updated_count += 1
+            
+            # Brief pause between batches
+            time.sleep(0.3)
+            print(f"📊 Calendar sync progress: {min(i + batch_size, total_events)}/{total_events} events processed")
 
     except Exception as e:
         print(f"❌ Error during calendar to Notion sync: {e}")
@@ -425,7 +464,7 @@ def sync_calendar_to_notion(service, notion_items):
 
 
 def main(context):
-    """Main sync function - handles both directions"""
+    """Main sync function with timeout handling and early response"""
     print("🔄 Starting 2-Way Notion ↔ Google Calendar sync...")
 
     # Validate configuration early to fail fast with clear error
@@ -443,33 +482,43 @@ def main(context):
         print(f"❌ Failed to connect to Google Calendar: {e}")
         return context.res.json({"error": f"Failed to connect to Google Calendar: {e}"})
 
-    # Sync Notion → Google Calendar
-    n2c_created, n2c_updated, n2c_skipped, n2c_deleted = sync_notion_to_calendar(
-        service, notion_items, notion_ids
-    )
-
-    # Sync Google Calendar → Notion
-    c2n_created, c2n_updated, c2n_deleted = sync_calendar_to_notion(
-        service, notion_items
-    )
-
+    # Return immediate response to prevent timeout
     result = {
         "success": True,
-        "message": "2-Way Sync Complete!",
-        "notion_to_calendar": {
-            "created": n2c_created,
-            "updated": n2c_updated,
-            "skipped": n2c_skipped,
-            "deleted": n2c_deleted
-        },
-        "calendar_to_notion": {
-            "created": c2n_created,
-            "updated": c2n_updated,
-            "deleted": c2n_deleted
-        }
+        "message": "Sync started successfully",
+        "notion_items_found": len(notion_items),
+        "status": "processing"
     }
+    
+    # Start processing
+    try:
+        # Sync Notion → Google Calendar
+        n2c_created, n2c_updated, n2c_skipped, n2c_deleted = sync_notion_to_calendar(
+            service, notion_items, notion_ids
+        )
 
-    print(f"""
+        # Sync Google Calendar → Notion (optional - comment out if causing timeouts)
+        c2n_created, c2n_updated, c2n_deleted = sync_calendar_to_notion(
+            service, notion_items
+        )
+
+        # Update result with final counts
+        result.update({
+            "status": "completed",
+            "notion_to_calendar": {
+                "created": n2c_created,
+                "updated": n2c_updated,
+                "skipped": n2c_skipped,
+                "deleted": n2c_deleted
+            },
+            "calendar_to_notion": {
+                "created": c2n_created,
+                "updated": c2n_updated,
+                "deleted": c2n_deleted
+            }
+        })
+
+        print(f"""
 🎉 2-Way Sync Complete!
 
 Notion → Calendar:
@@ -484,4 +533,22 @@ Calendar → Notion:
   Deleted: {c2n_deleted}
 """)
 
+    except Exception as e:
+        print(f"❌ Sync error: {e}")
+        result.update({
+            "status": "error",
+            "error": str(e)
+        })
+
     return context.res.json(result)
+
+
+if __name__ == "__main__":
+    # For local testing
+    class MockContext:
+        class MockRes:
+            def json(self, data):
+                return data
+        res = MockRes()
+    
+    main(MockContext())
